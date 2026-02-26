@@ -39,15 +39,27 @@ jobs:
       - name: Add swap (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo swapoff /swapfile || true
+          sudo rm -f /swapfile
           sudo fallocate -l 8G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
 
-      - name: Build release
+      - name: Build release (Linux)
+        if: runner.os == 'Linux'
         env:
-          CARGO_BUILD_JOBS: ${{ runner.os == 'Linux' && '2' || '' }}
-          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=-crt-static' || '' }}
+          CARGO_BUILD_JOBS: "2"
+        run: cargo build --release
+
+      - name: Build release (Windows)
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: -C target-feature=-crt-static
+        run: cargo build --release
+
+      - name: Build release (macOS)
+        if: runner.os == 'macOS'
         run: cargo build --release
 
       - name: Upload artifact
