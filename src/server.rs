@@ -73,14 +73,14 @@ async fn embeddings_handler(
         ));
     }
 
-    let mut data = Vec::with_capacity(texts.len());
+    let results = model
+        .embed_batch(&texts)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+
     let mut total_tokens = 0u32;
+    let mut data = Vec::with_capacity(results.len());
 
-    for (index, text) in texts.iter().enumerate() {
-        let emb = model
-            .embed(text)
-            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-
+    for (index, emb) in results.into_iter().enumerate() {
         total_tokens += emb.token_count;
         data.push(EmbeddingItem {
             object: "embedding",

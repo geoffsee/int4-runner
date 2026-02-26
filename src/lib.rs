@@ -21,7 +21,7 @@
 #[cfg(feature = "server")]
 pub mod server;
 
-use ndarray::Array2;
+use ndarray::{Array2, Axis};
 use ort::session::Session;
 use ort::value::Value;
 use std::path::Path;
@@ -127,13 +127,14 @@ impl EmbeddingModel {
         compute_embedding(&mut session, &self.tokenizer, text)
     }
 
-    /// Compute embeddings for multiple texts.
+    /// Compute embeddings for multiple texts in a single batched inference call.
     pub fn embed_batch<T: AsRef<str>>(&self, texts: &[T]) -> Result<Vec<Embedding>, Error> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut session = self.session.lock().map_err(|_| Error::Lock)?;
-        texts
-            .iter()
-            .map(|t| compute_embedding(&mut session, &self.tokenizer, t.as_ref()))
-            .collect()
+        let text_refs: Vec<&str> = texts.iter().map(|t| t.as_ref()).collect();
+        compute_embeddings_batch(&mut session, &self.tokenizer, &text_refs)
     }
 }
 
@@ -153,16 +154,12 @@ fn compute_embedding(
         ids
     };
 
-    let mut input_ids = vec![PAD_TOKEN_ID as i64; MAX_LENGTH];
-    let mut attention_mask = vec![0i64; MAX_LENGTH];
-    for (i, &id) in trunc_ids.iter().enumerate() {
-        input_ids[i] = id as i64;
-        attention_mask[i] = 1;
-    }
+    let input_ids: Vec<i64> = trunc_ids.iter().map(|&id| id as i64).collect();
+    let attention_mask = vec![1i64; len];
 
-    let input_ids_arr = Array2::from_shape_vec((1, MAX_LENGTH), input_ids)
+    let input_ids_arr = Array2::from_shape_vec((1, len), input_ids)
         .map_err(|e| Error::Tokenizer(e.to_string()))?;
-    let attention_mask_arr = Array2::from_shape_vec((1, MAX_LENGTH), attention_mask)
+    let attention_mask_arr = Array2::from_shape_vec((1, len), attention_mask)
         .map_err(|e| Error::Tokenizer(e.to_string()))?;
 
     let input_ids_val = Value::from_array(input_ids_arr)?;
@@ -179,4 +176,66 @@ fn compute_embedding(
         values,
         token_count: len as u32,
     })
+}
+
+fn compute_embeddings_batch(
+    session: &mut Session,
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[&str],
+) -> Result<Vec<Embedding>, Error> {
+    let n = texts.len();
+
+    let mut all_ids: Vec<Vec<i64>> = Vec::with_capacity(n);
+    let mut token_counts: Vec<u32> = Vec::with_capacity(n);
+    let mut max_len: usize = 0;
+
+    for &text in texts {
+        let encoding = tokenizer
+            .encode(text, true)
+            .map_err(|e| Error::Tokenizer(e.to_string()))?;
+        let ids = encoding.get_ids();
+        let len = ids.len().min(MAX_LENGTH);
+        let trunc_ids: Vec<i64> = ids[..len].iter().map(|&id| id as i64).collect();
+        max_len = max_len.max(len);
+        token_counts.push(len as u32);
+        all_ids.push(trunc_ids);
+    }
+
+    let mut input_ids = vec![PAD_TOKEN_ID as i64; n * max_len];
+    let mut attention_mask = vec![0i64; n * max_len];
+
+    for (i, ids) in all_ids.iter().enumerate() {
+        let offset = i * max_len;
+        for (j, &id) in ids.iter().enumerate() {
+            input_ids[offset + j] = id;
+            attention_mask[offset + j] = 1;
+        }
+    }
+
+    let input_ids_arr = Array2::from_shape_vec((n, max_len), input_ids)
+        .map_err(|e| Error::Tokenizer(e.to_string()))?;
+    let attention_mask_arr = Array2::from_shape_vec((n, max_len), attention_mask)
+        .map_err(|e| Error::Tokenizer(e.to_string()))?;
+
+    let input_ids_val = Value::from_array(input_ids_arr)?;
+    let attention_mask_val = Value::from_array(attention_mask_arr)?;
+
+    let outputs = session.run(ort::inputs![
+        "input_ids" => input_ids_val,
+        "attention_mask" => attention_mask_val,
+    ])?;
+
+    let embeddings = outputs["embeddings"].try_extract_array::<f32>()?;
+
+    let results: Vec<Embedding> = (0..n)
+        .map(|i| {
+            let row = embeddings.index_axis(Axis(0), i);
+            Embedding {
+                values: row.iter().cloned().collect(),
+                token_count: token_counts[i],
+            }
+        })
+        .collect();
+
+    Ok(results)
 }
