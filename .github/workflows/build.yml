@@ -26,7 +26,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           lfs: true
 
@@ -34,13 +34,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@2
+        uses: Swatinem/rust-cache@v2
 
       - name: Build release
         run: cargo build --release
 
       - name: Upload artifact
-        uses: actions/upload-artifact@4
+        uses: actions/upload-artifact@v6
         with:
           name: int4_runner-${{ matrix.name }}
           path: target/release/int4_runner${{ matrix.os == 'windows-latest' && '.exe' || '' }}
