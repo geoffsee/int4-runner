@@ -623,12 +623,14 @@ name = "int4_runner"
 version = "0.1.2"
 dependencies = [
  "axum",
+ "http-body-util",
  "ndarray",
  "ort",
  "serde",
  "serde_json",
  "tokenizers",
  "tokio",
+ "tower",
  "tower-http",
 ]
 

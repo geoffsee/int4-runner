@@ -206,6 +206,27 @@ async fn embeddings_handler(
     }))
 }
 
+/// Build the Axum [`Router`] for the embeddings API.
+///
+/// Returns a fully configured router with CORS and the
+/// `POST /v1/embeddings` endpoint. This is useful for testing via
+/// `tower::ServiceExt::oneshot` without binding a TCP port.
+///
+/// # Arguments
+///
+/// * `model` — A shared [`EmbeddingModel`] wrapped in an [`Arc`].
+pub fn app(model: Arc<EmbeddingModel>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    Router::new()
+        .route("/v1/embeddings", post(embeddings_handler))
+        .layer(cors)
+        .with_state(model)
+}
+
 /// Start the embeddings HTTP server.
 ///
 /// Binds to `0.0.0.0:{port}` and serves an OpenAI-compatible
@@ -239,21 +260,11 @@ pub async fn run_server(
     model: EmbeddingModel,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = Arc::new(model);
-
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    let app = Router::new()
-        .route("/v1/embeddings", post(embeddings_handler))
-        .layer(cors)
-        .with_state(state);
+    let router = app(Arc::new(model));
 
     let addr = (std::net::Ipv4Addr::UNSPECIFIED, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("Embeddings API: http://0.0.0.0:{port}/v1/embeddings");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, router).await?;
     Ok(())
 }
