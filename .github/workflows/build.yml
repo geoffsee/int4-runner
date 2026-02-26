@@ -52,10 +52,15 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: cargo build --release
 
+      - name: Configure dynamic CRT (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          printf '[target.x86_64-pc-windows-msvc]\nrustflags = ["-C", "target-feature=-crt-static"]\n' > .cargo/config.toml
+
       - name: Build release (Windows)
         if: runner.os == 'Windows'
-        env:
-          RUSTFLAGS: -C target-feature=-crt-static
         run: cargo build --release
 
       - name: Build release (macOS)
