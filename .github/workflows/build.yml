@@ -36,7 +36,18 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Add swap (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
       - name: Build release
+        env:
+          CARGO_BUILD_JOBS: ${{ runner.os == 'Linux' && '2' || '' }}
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=-crt-static' || '' }}
         run: cargo build --release
 
       - name: Upload artifact
