@@ -1,0 +1,4 @@
+# ONNX Runtime pre-built binaries use dynamic CRT (/MD) on Windows.
+# Match that for all native C/C++ dependencies compiled via the cc crate.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=-crt-static"]
