@@ -40,7 +40,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! int4_runner = { version = "0.1", default-features = false }
+//! int4_runner = { version = "0.2", default-features = false }
 //! ```
 //!
 //! # Loading a model
@@ -280,8 +280,17 @@ impl EmbeddingModel {
         std::fs::create_dir_all(&dir)?;
         let onnx_path = dir.join("model.int4.onnx");
         let data_path = dir.join("model.int4.onnx.data");
-        std::fs::File::create(&onnx_path)?.write_all(onnx)?;
-        std::fs::File::create(&data_path)?.write_all(onnx_data)?;
+
+        // Only write if the files don't exist OR have the wrong size to speed up subsequent startups.
+        let onnx_needs_write = std::fs::metadata(&onnx_path).map(|m| m.len()).unwrap_or(0) != onnx.len() as u64;
+        if onnx_needs_write {
+            std::fs::File::create(&onnx_path)?.write_all(onnx)?;
+        }
+        let data_needs_write = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0) != onnx_data.len() as u64;
+        if data_needs_write {
+            std::fs::File::create(&data_path)?.write_all(onnx_data)?;
+        }
+
         Self::from_file(onnx_path, tokenizer_json)
     }
 

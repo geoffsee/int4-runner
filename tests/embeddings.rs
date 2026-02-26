@@ -160,6 +160,19 @@ mod structural {
     }
 
     #[test]
+    fn batch_of_empty_strings() {
+        let model = model();
+        let batch = model.embed_batch(&["", ""]).unwrap();
+        assert_eq!(batch.len(), 2);
+        for emb in batch {
+            assert_eq!(emb.values.len(), 1024);
+            // If the tokenizer adds a BOS or EOS token, it will be 1.
+            println!("token_count for empty string: {}", emb.token_count);
+            assert!(emb.token_count <= 1);
+        }
+    }
+
+    #[test]
     fn empty_batch_returns_empty() {
         let result = model().embed_batch::<&str>(&[]).unwrap();
         assert!(result.is_empty());

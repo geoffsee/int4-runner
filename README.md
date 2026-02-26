@@ -31,6 +31,10 @@ curl -X POST http://localhost:8080/v1/embeddings \
 
 CORS is enabled so the endpoint can be called from browsers.
 
+## Performance
+
+See [PERFORMANCE.md](PERFORMANCE.md) for tips on optimizing inference speed, hardware acceleration, and batching.
+
 ## License
 
 MIT 2026 Copyright Geoff Seemueller

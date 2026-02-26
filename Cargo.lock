@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "int4_runner"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "axum",
  "http-body-util",
