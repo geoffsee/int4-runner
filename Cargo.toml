@@ -1,6 +1,6 @@
 [package]
 name = "int4_runner"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Geoff Seemueller"]
 description = "INT4-quantized ONNX embedding model inference"

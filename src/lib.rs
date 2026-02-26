@@ -1,21 +1,91 @@
 //! INT4-quantized ONNX embedding model inference.
 //!
-//! Provides [`EmbeddingModel`] for computing text embeddings using an
-//! INT4-quantized ONNX model (e.g. `octen-embedding-0.6b`).
+//! This crate provides [`EmbeddingModel`], a thread-safe wrapper around an
+//! INT4-quantized ONNX transformer model for computing dense text embeddings.
+//! It is designed for the `octen-embedding-0.6b` model but works with any
+//! ONNX model that accepts `input_ids` and `attention_mask` tensors and
+//! produces an `embeddings` output tensor.
 //!
-//! # Usage with external weights
+//! # Architecture
+//!
+//! ```text
+//!   text ──► Tokenizer (BPE) ──► token IDs ──► ONNX Runtime ──► Vec<f32>
+//! ```
+//!
+//! 1. Text is tokenized with a HuggingFace BPE tokenizer (including special tokens).
+//! 2. Token sequences are truncated to 512 tokens and padded for batching.
+//! 3. The ONNX Runtime performs INT4-quantized inference and returns embedding vectors.
+//!
+//! # Threading model
+//!
+//! [`EmbeddingModel`] wraps the ONNX [`Session`] in a
+//! [`Mutex`], so it is `Send + Sync` and can be shared
+//! across threads via `Arc<EmbeddingModel>`. Only one inference call executes
+//! at a time; concurrent callers block on the mutex. The tokenizer is
+//! immutable and accessed without locking.
+//!
+//! # Error handling
+//!
+//! All fallible operations return `Result<T, Error>`. The [`Error`] enum
+//! covers ONNX Runtime failures, tokenizer errors, file I/O problems, and
+//! mutex poisoning — no panics in the public API.
+//!
+//! # Feature flags
+//!
+//! | Feature  | Default | Description |
+//! |----------|---------|-------------|
+//! | `server` | **yes** | Enables the [`server`] module with an Axum-based OpenAI-compatible HTTP API. |
+//!
+//! Disable the server feature to use this crate as a pure embedding library:
+//!
+//! ```toml
+//! [dependencies]
+//! int4_runner = { version = "0.1", default-features = false }
+//! ```
+//!
+//! # Loading a model
+//!
+//! From files on disk (the `.onnx.data` external-weights file must sit next to
+//! the `.onnx` file):
 //!
 //! ```no_run
 //! use int4_runner::EmbeddingModel;
 //!
-//! let tokenizer_json = std::fs::read("path/to/tokenizer.json").unwrap();
+//! let tokenizer_json = std::fs::read("tokenizer/tokenizer.json").unwrap();
 //! let model = EmbeddingModel::from_file(
-//!     "path/to/model.int4.onnx",
+//!     "weights/model.int4.onnx",
 //!     &tokenizer_json,
 //! ).unwrap();
 //!
 //! let embedding = model.embed("hello world").unwrap();
-//! println!("embedding dim: {}", embedding.values.len());
+//! println!("dimensions: {}", embedding.values.len());
+//! ```
+//!
+//! From bytes compiled into the binary (useful for self-contained deployment):
+//!
+//! ```no_run
+//! use int4_runner::EmbeddingModel;
+//!
+//! static ONNX: &[u8] = include_bytes!("../weights/model.int4.onnx");
+//! static DATA: &[u8] = include_bytes!("../weights/model.int4.onnx.data");
+//! static TOK:  &[u8] = include_bytes!("../tokenizer/tokenizer.json");
+//!
+//! let model = EmbeddingModel::from_bytes(ONNX, DATA, TOK).unwrap();
+//! ```
+//!
+//! # Batch inference
+//!
+//! For multiple texts, [`EmbeddingModel::embed_batch`] is significantly faster
+//! than calling [`EmbeddingModel::embed`] in a loop because it performs a single
+//! ONNX inference pass over the entire batch:
+//!
+//! ```no_run
+//! # use int4_runner::EmbeddingModel;
+//! # let tokenizer_json = std::fs::read("tokenizer/tokenizer.json").unwrap();
+//! # let model = EmbeddingModel::from_file("weights/model.int4.onnx", &tokenizer_json).unwrap();
+//! let texts = vec!["first sentence", "second sentence", "third sentence"];
+//! let embeddings = model.embed_batch(&texts).unwrap();
+//! assert_eq!(embeddings.len(), 3);
 //! ```
 
 #[cfg(feature = "server")]
@@ -27,19 +97,44 @@ use ort::value::Value;
 use std::path::Path;
 use std::sync::Mutex;
 
+/// Maximum number of tokens per input sequence.
+///
+/// Sequences longer than this are silently truncated. This limit matches the
+/// positional-encoding length of the `octen-embedding-0.6b` model. Inputs
+/// shorter than `MAX_LENGTH` are *not* padded when processed individually
+/// (see [`EmbeddingModel::embed`]); batch inputs are padded to the longest
+/// sequence in the batch (see [`EmbeddingModel::embed_batch`]).
 const MAX_LENGTH: usize = 512;
+
+/// Token ID used for padding shorter sequences in batched inference.
+///
+/// This value (`151643`) is the `<|endoftext|>` token for the Qwen tokenizer
+/// used by `octen-embedding-0.6b`. Padded positions are masked out via the
+/// attention mask, so the specific ID has no effect on the output.
 const PAD_TOKEN_ID: u32 = 151643;
 
-/// Error type for embedding operations.
+/// Errors that can occur during model loading or inference.
+///
+/// Every public method on [`EmbeddingModel`] returns `Result<_, Error>`.
+/// The variants cover the full surface area: ONNX Runtime failures,
+/// tokenizer problems, filesystem I/O, and mutex poisoning.
 #[derive(Debug)]
 pub enum Error {
-    /// ONNX Runtime error.
+    /// The ONNX Runtime returned an error.
+    ///
+    /// Common causes: missing `.onnx.data` file, incompatible model graph,
+    /// or out-of-memory during inference.
     Ort(ort::Error),
-    /// Tokenizer loading or encoding error.
+    /// The tokenizer could not be loaded from JSON or failed to encode input.
+    ///
+    /// Wraps the underlying error message as a `String` because the
+    /// `tokenizers` crate error type is not `Send + Sync`.
     Tokenizer(String),
-    /// File I/O error.
+    /// A filesystem operation failed (e.g. creating temp files in
+    /// [`EmbeddingModel::from_bytes`]).
     Io(std::io::Error),
-    /// Session mutex was poisoned.
+    /// The internal [`Mutex`] was poisoned by a panicking
+    /// thread. Recovery is not possible; the model should be re-created.
     Lock,
 }
 
@@ -68,27 +163,72 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// A single embedding result.
+/// The result of embedding a single text.
+///
+/// Contains the dense embedding vector produced by the model together with
+/// the number of tokens actually consumed (after truncation to 512 tokens).
+/// The embedding dimensionality depends on the model; for
+/// `octen-embedding-0.6b` it is 1024.
 pub struct Embedding {
-    /// The embedding vector.
+    /// Dense embedding vector. The length equals the model's hidden
+    /// dimension (e.g. 1024 for `octen-embedding-0.6b`).
     pub values: Vec<f32>,
-    /// Number of tokens in the input (after truncation).
+    /// Number of tokens the tokenizer produced for this input, capped at 512.
+    /// Useful for tracking token usage and detecting truncation (if
+    /// `token_count == 512`, the input was likely truncated).
     pub token_count: u32,
 }
 
-/// INT4-quantized ONNX embedding model.
+/// An INT4-quantized ONNX embedding model ready for inference.
 ///
-/// Thread-safe: multiple threads may call [`embed`](Self::embed) concurrently.
+/// # Thread safety
+///
+/// `EmbeddingModel` is `Send + Sync`. The ONNX [`Session`] is protected by a
+/// [`Mutex`], so multiple threads may call [`embed`](Self::embed) or
+/// [`embed_batch`](Self::embed_batch) concurrently — callers simply block
+/// until the lock is available. The [`Tokenizer`](tokenizers::Tokenizer) is
+/// immutable after construction and requires no synchronization.
+///
+/// For maximum throughput under high concurrency, prefer
+/// [`embed_batch`](Self::embed_batch) to amortize the lock acquisition over
+/// many texts rather than calling [`embed`](Self::embed) per-text.
+///
+/// # Ownership
+///
+/// Owns both the ONNX session and tokenizer for the lifetime of the struct.
+/// Wrap in [`Arc`](std::sync::Arc) to share across tasks or threads.
 pub struct EmbeddingModel {
+    /// Mutex-protected ONNX Runtime session. The `ort` `Session` is `!Sync`,
+    /// so the mutex is required even though inference is logically read-only.
     session: Mutex<Session>,
+    /// BPE tokenizer loaded from HuggingFace-format JSON.
     tokenizer: tokenizers::Tokenizer,
 }
 
 impl EmbeddingModel {
-    /// Load from an ONNX file on disk and tokenizer JSON bytes.
+    /// Load a model from an ONNX file on disk and tokenizer JSON bytes.
     ///
-    /// `onnx_path` should point to the `.onnx` file. The corresponding
-    /// `.onnx.data` file (external weights) must be in the same directory.
+    /// # Arguments
+    ///
+    /// * `onnx_path` — Path to the `.onnx` model file. The corresponding
+    ///   external-weights file (e.g. `model.int4.onnx.data`) **must** exist in
+    ///   the same directory; ONNX Runtime resolves it automatically.
+    /// * `tokenizer_json` — Raw bytes of a HuggingFace `tokenizer.json`.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Ort`] — ONNX Runtime failed to build the session (missing
+    ///   file, corrupt graph, unsupported operators, etc.).
+    /// * [`Error::Tokenizer`] — The tokenizer JSON could not be parsed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use int4_runner::EmbeddingModel;
+    ///
+    /// let tok = std::fs::read("tokenizer/tokenizer.json").unwrap();
+    /// let model = EmbeddingModel::from_file("weights/model.int4.onnx", &tok).unwrap();
+    /// ```
     pub fn from_file(
         onnx_path: impl AsRef<Path>,
         tokenizer_json: &[u8],
@@ -102,10 +242,34 @@ impl EmbeddingModel {
         })
     }
 
-    /// Load from in-memory ONNX bytes.
+    /// Load a model from in-memory byte slices.
     ///
-    /// Writes `onnx` and `onnx_data` to a temp directory so ONNX Runtime can
-    /// load the external data file, then creates a session.
+    /// ONNX Runtime does not support loading external-weight models purely
+    /// from memory, so this method writes `onnx` and `onnx_data` to a temp
+    /// directory (`{temp_dir}/int4_runner_embed/`) and then delegates to
+    /// [`from_file`](Self::from_file). The temp files persist after the call
+    /// and are reused on subsequent invocations.
+    ///
+    /// This is the recommended path for self-contained binaries that embed
+    /// the model via [`include_bytes!`].
+    ///
+    /// # Arguments
+    ///
+    /// * `onnx` — Raw bytes of the `.onnx` model graph.
+    /// * `onnx_data` — Raw bytes of the `.onnx.data` external weights.
+    /// * `tokenizer_json` — Raw bytes of a HuggingFace `tokenizer.json`.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Io`] — Failed to create the temp directory or write files.
+    /// * [`Error::Ort`] — ONNX Runtime failed to load the written model.
+    /// * [`Error::Tokenizer`] — The tokenizer JSON could not be parsed.
+    ///
+    /// # Side effects
+    ///
+    /// Writes two files to `{std::env::temp_dir()}/int4_runner_embed/`:
+    /// `model.int4.onnx` and `model.int4.onnx.data`. These are **not**
+    /// cleaned up automatically.
     pub fn from_bytes(
         onnx: &[u8],
         onnx_data: &[u8],
@@ -121,13 +285,45 @@ impl EmbeddingModel {
         Self::from_file(onnx_path, tokenizer_json)
     }
 
-    /// Compute the embedding for a single text.
+    /// Compute the embedding for a single piece of text.
+    ///
+    /// Acquires the internal session lock, tokenizes `text`, runs ONNX
+    /// inference, and returns the resulting [`Embedding`]. If the input
+    /// exceeds 512 tokens it is silently truncated.
+    ///
+    /// For multiple texts, prefer [`embed_batch`](Self::embed_batch) which
+    /// performs a single inference call for the entire batch.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Lock`] — The session mutex was poisoned.
+    /// * [`Error::Tokenizer`] — Tokenization failed.
+    /// * [`Error::Ort`] — ONNX inference failed.
     pub fn embed(&self, text: &str) -> Result<Embedding, Error> {
         let mut session = self.session.lock().map_err(|_| Error::Lock)?;
         compute_embedding(&mut session, &self.tokenizer, text)
     }
 
     /// Compute embeddings for multiple texts in a single batched inference call.
+    ///
+    /// All inputs are tokenized, padded to the longest sequence in the batch,
+    /// and fed to ONNX Runtime as a single `(batch_size, max_len)` tensor pair.
+    /// This is substantially faster than calling [`embed`](Self::embed) in a
+    /// loop because it amortizes session-lock overhead and enables ONNX
+    /// Runtime's internal parallelism across the batch.
+    ///
+    /// Returns one [`Embedding`] per input text, in the same order. An empty
+    /// input slice returns `Ok(vec![])` without acquiring the lock.
+    ///
+    /// # Type parameter
+    ///
+    /// `T` can be `String`, `&str`, or any type implementing `AsRef<str>`.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Lock`] — The session mutex was poisoned.
+    /// * [`Error::Tokenizer`] — Tokenization failed for any input text.
+    /// * [`Error::Ort`] — ONNX inference failed.
     pub fn embed_batch<T: AsRef<str>>(&self, texts: &[T]) -> Result<Vec<Embedding>, Error> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -138,6 +334,17 @@ impl EmbeddingModel {
     }
 }
 
+/// Tokenize a single text, run inference, and return its embedding.
+///
+/// This is the inner implementation behind [`EmbeddingModel::embed`]. The
+/// caller is responsible for holding the session lock.
+///
+/// # Pipeline
+///
+/// 1. BPE-encode `text` with special tokens.
+/// 2. Truncate to [`MAX_LENGTH`] tokens.
+/// 3. Build `(1, len)` shaped `input_ids` and `attention_mask` tensors.
+/// 4. Run the ONNX session and extract the `"embeddings"` output.
 fn compute_embedding(
     session: &mut Session,
     tokenizer: &tokenizers::Tokenizer,
@@ -178,6 +385,18 @@ fn compute_embedding(
     })
 }
 
+/// Tokenize multiple texts, build a padded batch, and run a single inference call.
+///
+/// This is the inner implementation behind [`EmbeddingModel::embed_batch`].
+/// The caller is responsible for holding the session lock.
+///
+/// # Pipeline
+///
+/// 1. BPE-encode each text with special tokens and truncate to [`MAX_LENGTH`].
+/// 2. Pad all sequences to the longest in the batch using [`PAD_TOKEN_ID`].
+/// 3. Build `(batch_size, max_len)` shaped `input_ids` and `attention_mask` tensors.
+/// 4. Run the ONNX session once.
+/// 5. Slice the `"embeddings"` output along axis 0 to extract per-text vectors.
 fn compute_embeddings_batch(
     session: &mut Session,
     tokenizer: &tokenizers::Tokenizer,
