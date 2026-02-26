@@ -1,0 +1,46 @@
+# Cross-platform build for the embeddings server.
+# When this crate is the repo root, the workflow runs from here and builds the binary.
+# Requires model + tokenizer at compile time: either commit them or use the HF download step below.
+
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-aarch64
+          - os: windows-latest
+            name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@4
+        with:
+          name: int4_runner-${{ matrix.name }}
+          path: target/release/int4_runner${{ matrix.os == 'windows-latest' && '.exe' || '' }}

@@ -1,0 +1,8 @@
+# Build artifacts
+/target/
+
+# IDE
+.idea/
+*.swp
+*.swo
+node_modules
